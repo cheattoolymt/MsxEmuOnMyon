@@ -1,0 +1,343 @@
+system myon.useversion=1
+module myon.stdio
+
+// =====================================================================
+// MSX1 emulator written in Myon
+// ---------------------------------------------------------------------
+// Step 1: Memory + Z80 register/flag skeleton   <-- DONE (this file)
+// Step 2: Z80 instruction core                  <-- not started
+// Step 3: CB/ED prefixes, DJNZ, run()           <-- not started
+// Step 4: VDP TMS9918A                          <-- not started
+// Step 5: integration demos                     <-- not started
+//
+// Run:  ./myon msx.myon
+// =====================================================================
+
+// =====================================================================
+// Appendix A: bit operation helpers (pasted verbatim, do not modify)
+// Myon has no bit operators (& | ^ ~ << >>), so they are emulated with
+// arithmetic.
+// =====================================================================
+
+myon.func bit_and(a: int, b: int) ret int {
+    result = 0
+    place = 1
+    myon.while a > 0 myon.and b > 0 {
+        ra = a / 2
+        rb = b / 2
+        da = a - ra * 2
+        db = b - rb * 2
+        myon.if da == 1 myon.and db == 1 { result = result + place }
+        a = ra
+        b = rb
+        place = place * 2
+    }
+    ret result
+}
+
+myon.func bit_or(a: int, b: int) ret int {
+    result = 0
+    place = 1
+    myon.while a > 0 myon.or b > 0 {
+        ra = a / 2
+        rb = b / 2
+        da = a - ra * 2
+        db = b - rb * 2
+        myon.if da == 1 myon.or db == 1 { result = result + place }
+        a = ra
+        b = rb
+        place = place * 2
+    }
+    ret result
+}
+
+myon.func bit_xor(a: int, b: int) ret int {
+    result = 0
+    place = 1
+    myon.while a > 0 myon.or b > 0 {
+        ra = a / 2
+        rb = b / 2
+        da = a - ra * 2
+        db = b - rb * 2
+        myon.if da != db { result = result + place }
+        a = ra
+        b = rb
+        place = place * 2
+    }
+    ret result
+}
+
+myon.func shl(a: int, n: int) ret int {
+    result = a
+    i = 0
+    myon.while i < n {
+        result = result * 2
+        i = i + 1
+    }
+    ret result
+}
+
+myon.func shr(a: int, n: int) ret int {
+    result = a
+    i = 0
+    myon.while i < n {
+        result = result / 2
+        i = i + 1
+    }
+    ret result
+}
+
+myon.func mask8(a: int) ret int  { ret bit_and(a, 255) }
+myon.func mask16(a: int) ret int { ret bit_and(a, 65535) }
+myon.func hi8(a: int) ret int    { ret a / 256 }
+myon.func lo8(a: int) ret int    { ret bit_and(a, 255) }
+myon.func bit_not8(a: int) ret int  { ret 255 - a }
+myon.func bit_not16(a: int) ret int { ret 65535 - a }
+
+myon.func get_bit(val: int, n: int) ret int {
+    shifted = shr(val, n)
+    ret shifted - shifted / 2 * 2
+}
+
+myon.func set_bit(val: int, n: int, v: int) ret int {
+    b = shl(1, n)
+    cleared = val - bit_and(val, b)
+    myon.if v == 1 then { ret cleared + b }
+    ret cleared
+}
+
+// =====================================================================
+// Memory: flat 64KB address space
+// (MSX slot / mapper handling is intentionally simplified away)
+// =====================================================================
+
+myon.struct Memory {
+    mem: myon.array(int)
+
+    // Addresses are always masked to 16 bit before use, so a wrapping
+    // access such as 0x10000 reads 0x0000 like the real bus does.
+    myon.func read(addr: int) ret int {
+        ret self.mem[mask16(addr)]
+    }
+
+    myon.func write(addr: int, val: int) ret void {
+        self.mem[mask16(addr)] = mask8(val)
+    }
+}
+
+myon.func new_memory() ret Memory {
+    buf = myon.array(int)
+    myon.for i myon.in range(0, 65536) { buf.push(0) }
+    ret Memory(mem=buf)
+}
+
+// =====================================================================
+// Z80 CPU state
+// ---------------------------------------------------------------------
+// Verified against the Zilog Z80 CPU User Manual (UM0080) register set:
+//   main 8-bit registers : A F B C D E H L
+//   16-bit special       : IX IY SP PC
+//   interrupt control    : IFF1 IFF2 IM
+// The alternate register set (AF' BC' DE' HL') and the I / R registers
+// exist on real hardware but are not needed before EX/EXX and interrupt
+// modes are implemented, so they are deliberately left for a later Step.
+// =====================================================================
+
+myon.struct Z80 {
+    a: int
+    f: int
+    b: int
+    c: int
+    d: int
+    e: int
+    h: int
+    l: int
+    ix: int
+    iy: int
+    sp: int
+    pc: int
+    iff1: int
+    iff2: int
+    im: int
+    halted: int
+    cycles: int
+}
+
+myon.func new_z80() ret Z80 {
+    ret Z80(a=0, f=0, b=0, c=0, d=0, e=0, h=0, l=0,
+            ix=0, iy=0, sp=0xFFFF, pc=0,
+            iff1=0, iff2=0, im=0, halted=0, cycles=0)
+}
+
+// ---------------------------------------------------------------------
+// Register pair access (top level functions: struct methods may not
+// touch outer scope, but a struct passed as an argument is mutable)
+// ---------------------------------------------------------------------
+
+myon.func get_bc(cpu: Z80) ret int { ret cpu.b * 256 + cpu.c }
+myon.func get_de(cpu: Z80) ret int { ret cpu.d * 256 + cpu.e }
+myon.func get_hl(cpu: Z80) ret int { ret cpu.h * 256 + cpu.l }
+myon.func get_af(cpu: Z80) ret int { ret cpu.a * 256 + cpu.f }
+
+myon.func set_bc(cpu: Z80, val: int) ret void {
+    v = mask16(val)
+    cpu.b = hi8(v)
+    cpu.c = lo8(v)
+}
+
+myon.func set_de(cpu: Z80, val: int) ret void {
+    v = mask16(val)
+    cpu.d = hi8(v)
+    cpu.e = lo8(v)
+}
+
+myon.func set_hl(cpu: Z80, val: int) ret void {
+    v = mask16(val)
+    cpu.h = hi8(v)
+    cpu.l = lo8(v)
+}
+
+myon.func set_af(cpu: Z80, val: int) ret void {
+    v = mask16(val)
+    cpu.a = hi8(v)
+    cpu.f = lo8(v)
+}
+
+// ---------------------------------------------------------------------
+// Flag register F layout (confirmed by research, z80.info "Z80 Flag
+// Affection" / UM0080):
+//
+//   bit : 7   6   5    4   3    2     1   0
+//   flag: S   Z   F5   H   F3   P/V   N   C
+//
+//   S   (bit7) sign      : copy of the MSB of the result
+//   Z   (bit6) zero      : result is zero
+//   F5  (bit5) undocumented: copy of bit 5 of the result
+//   H   (bit4) half carry: carry out of bit 3 into bit 4
+//   F3  (bit3) undocumented: copy of bit 3 of the result
+//   P/V (bit2) parity/overflow
+//   N   (bit1) add/subtract: set when the last operation was a subtract
+//   C   (bit0) carry      : result did not fit in the register
+// ---------------------------------------------------------------------
+
+myon.func get_flag_c(cpu: Z80) ret int  { ret get_bit(cpu.f, 0) }
+myon.func get_flag_n(cpu: Z80) ret int  { ret get_bit(cpu.f, 1) }
+myon.func get_flag_pv(cpu: Z80) ret int { ret get_bit(cpu.f, 2) }
+myon.func get_flag_f3(cpu: Z80) ret int { ret get_bit(cpu.f, 3) }
+myon.func get_flag_h(cpu: Z80) ret int  { ret get_bit(cpu.f, 4) }
+myon.func get_flag_f5(cpu: Z80) ret int { ret get_bit(cpu.f, 5) }
+myon.func get_flag_z(cpu: Z80) ret int  { ret get_bit(cpu.f, 6) }
+myon.func get_flag_s(cpu: Z80) ret int  { ret get_bit(cpu.f, 7) }
+
+myon.func set_flag_c(cpu: Z80, v: int) ret void  { cpu.f = set_bit(cpu.f, 0, v) }
+myon.func set_flag_n(cpu: Z80, v: int) ret void  { cpu.f = set_bit(cpu.f, 1, v) }
+myon.func set_flag_pv(cpu: Z80, v: int) ret void { cpu.f = set_bit(cpu.f, 2, v) }
+myon.func set_flag_f3(cpu: Z80, v: int) ret void { cpu.f = set_bit(cpu.f, 3, v) }
+myon.func set_flag_h(cpu: Z80, v: int) ret void  { cpu.f = set_bit(cpu.f, 4, v) }
+myon.func set_flag_f5(cpu: Z80, v: int) ret void { cpu.f = set_bit(cpu.f, 5, v) }
+myon.func set_flag_z(cpu: Z80, v: int) ret void  { cpu.f = set_bit(cpu.f, 6, v) }
+myon.func set_flag_s(cpu: Z80, v: int) ret void  { cpu.f = set_bit(cpu.f, 7, v) }
+
+// ---------------------------------------------------------------------
+// Debug helpers
+// ---------------------------------------------------------------------
+
+myon.func dump_regs(cpu: Z80) ret void {
+    myon.print("=== Z80 registers ===")
+    myon.print("A={cpu.a} F={cpu.f}  BC={get_bc(cpu)} DE={get_de(cpu)} HL={get_hl(cpu)}")
+    myon.print("IX={cpu.ix} IY={cpu.iy} SP={cpu.sp} PC={cpu.pc}")
+    myon.print("S={get_flag_s(cpu)} Z={get_flag_z(cpu)} H={get_flag_h(cpu)} PV={get_flag_pv(cpu)} N={get_flag_n(cpu)} C={get_flag_c(cpu)}")
+    myon.print("IFF1={cpu.iff1} IFF2={cpu.iff2} IM={cpu.im} HALTED={cpu.halted} CYCLES={cpu.cycles}")
+}
+
+// =====================================================================
+// Step 1 verification
+// =====================================================================
+
+checks_total = 0
+checks_failed = 0
+
+myon.func check_int(label: str, actual: int, expected: int) ret void {
+    checks_total = checks_total + 1
+    myon.if actual == expected {
+        myon.print("  ok   {label}: {actual}")
+    } myon.else {
+        checks_failed = checks_failed + 1
+        myon.print("  FAIL {label}: got {actual}, expected {expected}")
+    }
+}
+
+mem = new_memory()
+cpu = new_z80()
+
+myon.print("--- Step 1: Memory ---")
+check_int(str("memory size"), mem.mem.length(), 65536)
+check_int(str("initial value at 0x0000"), mem.read(0x0000), 0)
+mem.write(0xC000, 0xAA)
+check_int(str("write/read 0xC000"), mem.read(0xC000), 0xAA)
+check_int(str("address wraps to 16bit"), mem.read(0x1C000), 0xAA)
+mem.write(0xC001, 0x1FF)
+check_int(str("value masked to 8bit"), mem.read(0xC001), 0xFF)
+
+myon.print("--- Step 1: register pairs ---")
+set_bc(cpu, 0x1234)
+myon.print("B={cpu.b} C={cpu.c}")
+check_int(str("set_bc -> B"), cpu.b, 0x12)
+check_int(str("set_bc -> C"), cpu.c, 0x34)
+check_int(str("get_bc"), get_bc(cpu), 0x1234)
+
+set_de(cpu, 0xBEEF)
+check_int(str("get_de"), get_de(cpu), 0xBEEF)
+set_hl(cpu, 0xC000)
+check_int(str("get_hl"), get_hl(cpu), 0xC000)
+set_af(cpu, 0x5A81)
+check_int(str("set_af -> A"), cpu.a, 0x5A)
+check_int(str("set_af -> F"), cpu.f, 0x81)
+check_int(str("get_af"), get_af(cpu), 0x5A81)
+set_hl(cpu, 0x10000)
+check_int(str("set_hl wraps to 16bit"), get_hl(cpu), 0x0000)
+
+myon.print("--- Step 1: flags ---")
+cpu.f = 0
+set_flag_z(cpu, 1)
+myon.print("Z={get_flag_z(cpu)}")
+check_int(str("Z is bit6"), cpu.f, 0x40)
+set_flag_c(cpu, 1)
+check_int(str("C is bit0"), cpu.f, 0x41)
+set_flag_n(cpu, 1)
+check_int(str("N is bit1"), cpu.f, 0x43)
+set_flag_pv(cpu, 1)
+check_int(str("PV is bit2"), cpu.f, 0x47)
+set_flag_h(cpu, 1)
+check_int(str("H is bit4"), cpu.f, 0x57)
+set_flag_s(cpu, 1)
+check_int(str("S is bit7"), cpu.f, 0xD7)
+set_flag_f3(cpu, 1)
+check_int(str("F3 is bit3"), cpu.f, 0xDF)
+set_flag_f5(cpu, 1)
+check_int(str("F5 is bit5"), cpu.f, 0xFF)
+
+set_flag_z(cpu, 0)
+check_int(str("clearing Z keeps the rest"), cpu.f, 0xBF)
+check_int(str("get_flag_z after clear"), get_flag_z(cpu), 0)
+check_int(str("get_flag_s"), get_flag_s(cpu), 1)
+check_int(str("get_flag_c"), get_flag_c(cpu), 1)
+
+cpu.f = 0
+check_int(str("all flags cleared"), cpu.f, 0)
+
+myon.print("--- Step 1: initial CPU state ---")
+fresh = new_z80()
+check_int(str("PC starts at 0"), fresh.pc, 0)
+check_int(str("SP starts at 0xFFFF"), fresh.sp, 0xFFFF)
+check_int(str("not halted"), fresh.halted, 0)
+check_int(str("no cycles consumed"), fresh.cycles, 0)
+
+dump_regs(cpu)
+
+myon.print("=== Step 1 result ===")
+myon.if checks_failed == 0 {
+    myon.print("all {checks_total} checks passed")
+} myon.else {
+    myon.print("{checks_failed} of {checks_total} checks FAILED")
+}
