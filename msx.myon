@@ -4,8 +4,8 @@ module myon.stdio
 // =====================================================================
 // MSX1 emulator written in Myon
 // ---------------------------------------------------------------------
-// Step 1: Memory + Z80 register/flag skeleton   <-- DONE (this file)
-// Step 2: Z80 instruction core                  <-- not started
+// Step 1: Memory + Z80 register/flag skeleton   <-- DONE
+// Step 2: Z80 instruction core                  <-- DONE (this file)
 // Step 3: CB/ED prefixes, DJNZ, run()           <-- not started
 // Step 4: VDP TMS9918A                          <-- not started
 // Step 5: integration demos                     <-- not started
@@ -250,6 +250,700 @@ myon.func dump_regs(cpu: Z80) ret void {
     myon.print("IFF1={cpu.iff1} IFF2={cpu.iff2} IM={cpu.im} HALTED={cpu.halted} CYCLES={cpu.cycles}")
 }
 
+// Same state, in the hex notation an assembler listing uses.
+// hex8/hex16 are defined with the Step 2 helpers below.
+myon.func dump_regs_hex(cpu: Z80) ret void {
+    myon.print("=== Z80 registers (hex) ===")
+    myon.print("AF={hex16(get_af(cpu))} BC={hex16(get_bc(cpu))} DE={hex16(get_de(cpu))} HL={hex16(get_hl(cpu))}")
+    myon.print("IX={hex16(cpu.ix)} IY={hex16(cpu.iy)} SP={hex16(cpu.sp)} PC={hex16(cpu.pc)}")
+    myon.print("S={get_flag_s(cpu)} Z={get_flag_z(cpu)} H={get_flag_h(cpu)} PV={get_flag_pv(cpu)} N={get_flag_n(cpu)} C={get_flag_c(cpu)}")
+    myon.print("HALTED={cpu.halted} CYCLES={cpu.cycles}")
+}
+
+// =====================================================================
+// Step 2: Z80 instruction execution core
+// ---------------------------------------------------------------------
+// Opcode decoding follows the octal structure documented at
+// z80.info/decoding.htm, which is how the real Z80 decodes instructions:
+//
+//   bit :  7  6 | 5  4  3 | 2  1  0
+//          x    |    y    |    z          p = y >> 1 (bits 5-4)
+//                                         q = y  & 1 (bit 3)
+//
+//   x=0  relative jumps / 16-bit loads / INC-DEC / 8-bit load immediate
+//   x=1  LD r[y], r[z]         (y=6,z=6 is HALT instead of LD (HL),(HL))
+//   x=2  alu[y] r[z]
+//   x=3  conditional flow, stack, immediate alu, prefixes
+//
+//   r   [0..7] = B C D E H L (HL) A
+//   rp  [0..3] = BC DE HL SP
+//   rp2 [0..3] = BC DE HL AF
+//   cc  [0..7] = NZ Z NC C PO PE P M
+//   alu [0..7] = ADD A, / ADC A, / SUB / SBC A, / AND / XOR / OR / CP
+//
+// Cycle counts are the plain Z80 timings from the MSX Assembly Page
+// instruction table (map.grauw.nl/resources/z80instr.php); the MSX M1
+// wait states are deliberately not added yet.
+//
+// Flag effects follow z80.info/z80sflag.htm ("Z80 Flag Affection"):
+//   ADD/ADC/SUB/SBC  SZ5H3VNC
+//   CP r             SZ*H*VNC   F5/F3 come from the operand, not result
+//   INC/DEC r        SZ5H3VN-   carry untouched
+//   AND r            SZ513P00
+//   OR/XOR r         SZ503P00
+//   ADD HL,ss        --***-0C   F5/H/F3 from the high-byte addition
+//
+// Instructions belonging to later Steps (CB / ED prefixes, DJNZ) and
+// instructions outside this Step's scope are reported as [UNIMPL] and
+// consume 4 cycles, so a program can keep running while it is obvious
+// what is still missing.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// Signed-safe wrapping.
+// Appendix A's bit_and stops as soon as a <= 0, so mask8(-1) yields 0
+// instead of 0xFF. Arithmetic results may legitimately go negative
+// (SUB, DEC, backwards JR), so bring the value into range first.
+// Appendix A itself must not be modified, hence these wrappers.
+// ---------------------------------------------------------------------
+
+myon.func wrap8(v: int) ret int {
+    x = v
+    myon.while x < 0 { x = x + 256 }
+    ret mask8(x)
+}
+
+myon.func wrap16(v: int) ret int {
+    x = v
+    myon.while x < 0 { x = x + 65536 }
+    ret mask16(x)
+}
+
+// Reinterpret an unsigned 8-bit value as a two's complement signed byte
+// (used for the displacement of the relative jumps).
+myon.func signed8(v: int) ret int {
+    b = mask8(v)
+    myon.if b > 127 then { ret b - 256 }
+    ret b
+}
+
+// ---------------------------------------------------------------------
+// Hex formatting for diagnostics.
+// The specification's [UNIMPL] template is "0x{str(op)}", but str() is
+// decimal, so opcode 0x10 would be printed as "0x16". Opcodes are always
+// read as hex, so a wrong label would send debugging the wrong way;
+// format them properly instead.
+// ---------------------------------------------------------------------
+
+myon.func hex_digit(v: int) ret str {
+    myon.if v == 0 then { ret str("0") }
+    myon.if v == 1 then { ret str("1") }
+    myon.if v == 2 then { ret str("2") }
+    myon.if v == 3 then { ret str("3") }
+    myon.if v == 4 then { ret str("4") }
+    myon.if v == 5 then { ret str("5") }
+    myon.if v == 6 then { ret str("6") }
+    myon.if v == 7 then { ret str("7") }
+    myon.if v == 8 then { ret str("8") }
+    myon.if v == 9 then { ret str("9") }
+    myon.if v == 10 then { ret str("A") }
+    myon.if v == 11 then { ret str("B") }
+    myon.if v == 12 then { ret str("C") }
+    myon.if v == 13 then { ret str("D") }
+    myon.if v == 14 then { ret str("E") }
+    ret str("F")
+}
+
+myon.func hex8(v: int) ret str {
+    b = mask8(v)
+    ret hex_digit(b / 16) + hex_digit(bit_and(b, 15))
+}
+
+myon.func hex16(v: int) ret str {
+    w = mask16(v)
+    ret hex8(w / 256) + hex8(bit_and(w, 255))
+}
+
+// ---------------------------------------------------------------------
+// I/O ports
+// ---------------------------------------------------------------------
+// Step 2 only needs somewhere for OUT/IN to land so the instructions can
+// be tested. The MSX peripherals themselves (VDP on $98/$99) arrive in
+// Step 4, which will dispatch on the port number instead.
+// ---------------------------------------------------------------------
+
+myon.struct IO {
+    ports: myon.array(int)
+
+    myon.func write(port: int, val: int) ret void {
+        self.ports[mask8(port)] = mask8(val)
+    }
+
+    myon.func read(port: int) ret int {
+        ret self.ports[mask8(port)]
+    }
+}
+
+myon.func new_io() ret IO {
+    buf = myon.array(int)
+    myon.for i myon.in range(0, 256) { buf.push(0) }
+    ret IO(ports=buf)
+}
+
+// ---------------------------------------------------------------------
+// Instruction fetch
+// ---------------------------------------------------------------------
+
+myon.func fetch8(cpu: Z80, mem: Memory) ret int {
+    v = mem.read(cpu.pc)
+    cpu.pc = mask16(cpu.pc + 1)
+    ret v
+}
+
+// 16-bit immediate data is stored least significant byte first.
+myon.func fetch16(cpu: Z80, mem: Memory) ret int {
+    lo = fetch8(cpu, mem)
+    hi = fetch8(cpu, mem)
+    ret hi * 256 + lo
+}
+
+// ---------------------------------------------------------------------
+// Table "r": B C D E H L (HL) A
+// ---------------------------------------------------------------------
+
+myon.func get_r(cpu: Z80, mem: Memory, idx: int) ret int {
+    myon.if idx == 0 then { ret cpu.b }
+    myon.if idx == 1 then { ret cpu.c }
+    myon.if idx == 2 then { ret cpu.d }
+    myon.if idx == 3 then { ret cpu.e }
+    myon.if idx == 4 then { ret cpu.h }
+    myon.if idx == 5 then { ret cpu.l }
+    myon.if idx == 6 then { ret mem.read(get_hl(cpu)) }
+    ret cpu.a
+}
+
+myon.func set_r(cpu: Z80, mem: Memory, idx: int, val: int) ret void {
+    v = mask8(val)
+    myon.if idx == 0 then { cpu.b = v  ret }
+    myon.if idx == 1 then { cpu.c = v  ret }
+    myon.if idx == 2 then { cpu.d = v  ret }
+    myon.if idx == 3 then { cpu.e = v  ret }
+    myon.if idx == 4 then { cpu.h = v  ret }
+    myon.if idx == 5 then { cpu.l = v  ret }
+    myon.if idx == 6 then { mem.write(get_hl(cpu), v)  ret }
+    cpu.a = v
+}
+
+// ---------------------------------------------------------------------
+// Table "rp": BC DE HL SP   /   Table "rp2": BC DE HL AF
+// ---------------------------------------------------------------------
+
+myon.func get_rp(cpu: Z80, idx: int) ret int {
+    myon.if idx == 0 then { ret get_bc(cpu) }
+    myon.if idx == 1 then { ret get_de(cpu) }
+    myon.if idx == 2 then { ret get_hl(cpu) }
+    ret cpu.sp
+}
+
+myon.func set_rp(cpu: Z80, idx: int, val: int) ret void {
+    myon.if idx == 0 then { set_bc(cpu, val)  ret }
+    myon.if idx == 1 then { set_de(cpu, val)  ret }
+    myon.if idx == 2 then { set_hl(cpu, val)  ret }
+    cpu.sp = mask16(val)
+}
+
+myon.func get_rp2(cpu: Z80, idx: int) ret int {
+    myon.if idx == 0 then { ret get_bc(cpu) }
+    myon.if idx == 1 then { ret get_de(cpu) }
+    myon.if idx == 2 then { ret get_hl(cpu) }
+    ret get_af(cpu)
+}
+
+myon.func set_rp2(cpu: Z80, idx: int, val: int) ret void {
+    myon.if idx == 0 then { set_bc(cpu, val)  ret }
+    myon.if idx == 1 then { set_de(cpu, val)  ret }
+    myon.if idx == 2 then { set_hl(cpu, val)  ret }
+    set_af(cpu, val)
+}
+
+// ---------------------------------------------------------------------
+// Table "cc": NZ Z NC C PO PE P M
+// ---------------------------------------------------------------------
+
+myon.func test_cc(cpu: Z80, idx: int) ret int {
+    myon.if idx == 0 then { ret 1 - get_flag_z(cpu) }
+    myon.if idx == 1 then { ret get_flag_z(cpu) }
+    myon.if idx == 2 then { ret 1 - get_flag_c(cpu) }
+    myon.if idx == 3 then { ret get_flag_c(cpu) }
+    myon.if idx == 4 then { ret 1 - get_flag_pv(cpu) }
+    myon.if idx == 5 then { ret get_flag_pv(cpu) }
+    myon.if idx == 6 then { ret 1 - get_flag_s(cpu) }
+    ret get_flag_s(cpu)
+}
+
+// ---------------------------------------------------------------------
+// Flag computation helpers
+// ---------------------------------------------------------------------
+
+// P/V as parity: set when the number of set bits is even.
+myon.func parity8(v: int) ret int {
+    b = mask8(v)
+    n = 0
+    i = 0
+    myon.while i < 8 {
+        n = n + get_bit(b, i)
+        i = i + 1
+    }
+    half = n / 2
+    myon.if n - half * 2 == 0 then { ret 1 }
+    ret 0
+}
+
+// S, Z and the two undocumented flags F5/F3, all taken from a result.
+myon.func set_flags_sz53(cpu: Z80, res: int) ret void {
+    r = mask8(res)
+    set_flag_s(cpu, get_bit(r, 7))
+    myon.if r == 0 then { set_flag_z(cpu, 1) } myon.else { set_flag_z(cpu, 0) }
+    set_flag_f5(cpu, get_bit(r, 5))
+    set_flag_f3(cpu, get_bit(r, 3))
+}
+
+// F5/F3 alone, for CP where they come from the operand.
+myon.func set_flags_53_from(cpu: Z80, src: int) ret void {
+    s = mask8(src)
+    set_flag_f5(cpu, get_bit(s, 5))
+    set_flag_f3(cpu, get_bit(s, 3))
+}
+
+myon.func set_flag_bool(cpu: Z80, which: int, cond: bool) ret void {
+    v = 0
+    myon.if cond then { v = 1 }
+    myon.if which == 0 then { set_flag_c(cpu, v)  ret }
+    myon.if which == 1 then { set_flag_n(cpu, v)  ret }
+    myon.if which == 2 then { set_flag_pv(cpu, v)  ret }
+    set_flag_h(cpu, v)
+}
+
+// Signed overflow for an 8-bit addition: both operands share a sign and
+// the result does not.
+myon.func overflow_add8(a: int, b: int, res: int) ret int {
+    sa = get_bit(mask8(a), 7)
+    sb = get_bit(mask8(b), 7)
+    sr = get_bit(mask8(res), 7)
+    myon.if sa != sb then { ret 0 }
+    myon.if sr == sa then { ret 0 }
+    ret 1
+}
+
+// Signed overflow for an 8-bit subtraction: operands differ in sign and
+// the result does not match the minuend.
+myon.func overflow_sub8(a: int, b: int, res: int) ret int {
+    sa = get_bit(mask8(a), 7)
+    sb = get_bit(mask8(b), 7)
+    sr = get_bit(mask8(res), 7)
+    myon.if sa == sb then { ret 0 }
+    myon.if sr == sa then { ret 0 }
+    ret 1
+}
+
+// ---------------------------------------------------------------------
+// 8-bit ALU  (table "alu")
+// ---------------------------------------------------------------------
+
+// ADD A,val (cin=0) and ADC A,val (cin=carry). Flags SZ5H3VNC.
+myon.func alu_add(cpu: Z80, val: int, cin: int) ret void {
+    a = cpu.a
+    v = mask8(val)
+    total = a + v + cin
+    res = wrap8(total)
+    lo_sum = bit_and(a, 15) + bit_and(v, 15) + cin
+    set_flags_sz53(cpu, res)
+    set_flag_n(cpu, 0)
+    set_flag_bool(cpu, 0, total > 255)
+    set_flag_bool(cpu, 3, lo_sum > 15)
+    set_flag_pv(cpu, overflow_add8(a, v, res))
+    cpu.a = res
+}
+
+// SUB val / SBC A,val (store=1) and CP val (store=0).
+// CP is SUB with the result discarded, but F5/F3 come from the operand.
+myon.func alu_sub(cpu: Z80, val: int, cin: int, store: int) ret void {
+    a = cpu.a
+    v = mask8(val)
+    total = a - v - cin
+    res = wrap8(total)
+    lo_diff = bit_and(a, 15) - bit_and(v, 15) - cin
+    set_flags_sz53(cpu, res)
+    set_flag_n(cpu, 1)
+    set_flag_bool(cpu, 0, total < 0)
+    set_flag_bool(cpu, 3, lo_diff < 0)
+    set_flag_pv(cpu, overflow_sub8(a, v, res))
+    myon.if store == 1 then {
+        cpu.a = res
+    } myon.else {
+        set_flags_53_from(cpu, v)
+    }
+}
+
+// AND val: SZ513P00 (H is always set for AND).
+myon.func alu_and(cpu: Z80, val: int) ret void {
+    res = bit_and(cpu.a, mask8(val))
+    cpu.a = res
+    set_flags_sz53(cpu, res)
+    set_flag_h(cpu, 1)
+    set_flag_n(cpu, 0)
+    set_flag_c(cpu, 0)
+    set_flag_pv(cpu, parity8(res))
+}
+
+// XOR val: SZ503P00
+myon.func alu_xor(cpu: Z80, val: int) ret void {
+    res = bit_xor(cpu.a, mask8(val))
+    cpu.a = res
+    set_flags_sz53(cpu, res)
+    set_flag_h(cpu, 0)
+    set_flag_n(cpu, 0)
+    set_flag_c(cpu, 0)
+    set_flag_pv(cpu, parity8(res))
+}
+
+// OR val: SZ503P00
+myon.func alu_or(cpu: Z80, val: int) ret void {
+    res = bit_or(cpu.a, mask8(val))
+    cpu.a = res
+    set_flags_sz53(cpu, res)
+    set_flag_h(cpu, 0)
+    set_flag_n(cpu, 0)
+    set_flag_c(cpu, 0)
+    set_flag_pv(cpu, parity8(res))
+}
+
+myon.func alu_apply(cpu: Z80, idx: int, val: int) ret void {
+    myon.if idx == 0 then { alu_add(cpu, val, 0)  ret }
+    myon.if idx == 1 then { alu_add(cpu, val, get_flag_c(cpu))  ret }
+    myon.if idx == 2 then { alu_sub(cpu, val, 0, 1)  ret }
+    myon.if idx == 3 then { alu_sub(cpu, val, get_flag_c(cpu), 1)  ret }
+    myon.if idx == 4 then { alu_and(cpu, val)  ret }
+    myon.if idx == 5 then { alu_xor(cpu, val)  ret }
+    myon.if idx == 6 then { alu_or(cpu, val)  ret }
+    alu_sub(cpu, val, 0, 0)
+}
+
+// ---------------------------------------------------------------------
+// INC / DEC (8-bit): SZ5H3VN-, the carry flag is left untouched
+// ---------------------------------------------------------------------
+
+myon.func inc8(cpu: Z80, val: int) ret int {
+    v = mask8(val)
+    res = mask8(v + 1)
+    set_flags_sz53(cpu, res)
+    set_flag_n(cpu, 0)
+    // half carry whenever the low nibble rolls over from 0xF
+    set_flag_bool(cpu, 3, bit_and(v, 15) == 15)
+    // the only signed overflow is +127 -> -128
+    set_flag_bool(cpu, 2, v == 127)
+    ret res
+}
+
+myon.func dec8(cpu: Z80, val: int) ret int {
+    v = mask8(val)
+    res = wrap8(v - 1)
+    set_flags_sz53(cpu, res)
+    set_flag_n(cpu, 1)
+    // borrow out of the low nibble when it is already 0
+    set_flag_bool(cpu, 3, bit_and(v, 15) == 0)
+    // the only signed overflow is -128 -> +127
+    set_flag_bool(cpu, 2, v == 128)
+    ret res
+}
+
+// ---------------------------------------------------------------------
+// ADD HL,ss : --***-0C
+// The real CPU adds the low bytes and then the high bytes, so H and the
+// undocumented F5/F3 reflect the high-byte addition.
+// ---------------------------------------------------------------------
+
+myon.func add16_hl(cpu: Z80, val: int) ret void {
+    hl = get_hl(cpu)
+    v = mask16(val)
+    total = hl + v
+    res = mask16(total)
+    set_hl(cpu, res)
+    set_flag_n(cpu, 0)
+    set_flag_bool(cpu, 0, total > 65535)
+    set_flag_bool(cpu, 3, bit_and(hl, 4095) + bit_and(v, 4095) > 4095)
+    set_flags_53_from(cpu, hi8(res))
+}
+
+// ---------------------------------------------------------------------
+// Stack (grows downwards, high byte stored first)
+// ---------------------------------------------------------------------
+
+myon.func push16(cpu: Z80, mem: Memory, val: int) ret void {
+    v = mask16(val)
+    cpu.sp = wrap16(cpu.sp - 1)
+    mem.write(cpu.sp, hi8(v))
+    cpu.sp = wrap16(cpu.sp - 1)
+    mem.write(cpu.sp, lo8(v))
+}
+
+myon.func pop16(cpu: Z80, mem: Memory) ret int {
+    lo = mem.read(cpu.sp)
+    cpu.sp = mask16(cpu.sp + 1)
+    hi = mem.read(cpu.sp)
+    cpu.sp = mask16(cpu.sp + 1)
+    ret hi * 256 + lo
+}
+
+// =====================================================================
+// step: execute exactly one instruction, return the cycles it consumed
+// =====================================================================
+
+myon.func step(cpu: Z80, mem: Memory, io: IO) ret int {
+    // A halted CPU keeps burning NOPs until an interrupt arrives.
+    myon.if cpu.halted == 1 then {
+        cpu.cycles = cpu.cycles + 4
+        ret 4
+    }
+
+    op = fetch8(cpu, mem)
+
+    // octal decomposition of the opcode
+    x = op / 64
+    y = op / 8 - x * 8
+    z = op - op / 8 * 8
+    p = y / 2
+    q = y - p * 2
+
+    cyc = 4
+    known = 1
+
+    myon.if x == 0 {
+        // -------------------------------------------------------------
+        // x=0: relative jumps, 16-bit loads, INC/DEC, load immediate
+        // -------------------------------------------------------------
+        myon.if z == 0 {
+            myon.if y == 0 {
+                // NOP
+                cyc = 4
+            } myon.elif y == 3 then {
+                // JR d  (target = address after the instruction + d)
+                d = signed8(fetch8(cpu, mem))
+                cpu.pc = wrap16(cpu.pc + d)
+                cyc = 12
+            } myon.elif y > 3 then {
+                // JR cc[y-4], d
+                d2 = signed8(fetch8(cpu, mem))
+                myon.if test_cc(cpu, y - 4) == 1 {
+                    cpu.pc = wrap16(cpu.pc + d2)
+                    cyc = 12
+                } myon.else {
+                    cyc = 7
+                }
+            } myon.else {
+                // y=1 EX AF,AF'  (needs the alternate register set)
+                // y=2 DJNZ d     (Step 3)
+                known = 0
+            }
+        } myon.elif z == 1 then {
+            myon.if q == 0 {
+                // LD rp[p], nn
+                set_rp(cpu, p, fetch16(cpu, mem))
+                cyc = 10
+            } myon.else {
+                // ADD HL, rp[p]
+                add16_hl(cpu, get_rp(cpu, p))
+                cyc = 11
+            }
+        } myon.elif z == 2 then {
+            // indirect loading
+            myon.if q == 0 {
+                myon.if p == 0 {
+                    // LD (BC), A
+                    mem.write(get_bc(cpu), cpu.a)
+                    cyc = 7
+                } myon.elif p == 1 then {
+                    // LD (DE), A
+                    mem.write(get_de(cpu), cpu.a)
+                    cyc = 7
+                } myon.elif p == 2 then {
+                    // LD (nn), HL   (low byte first)
+                    addr_wh = fetch16(cpu, mem)
+                    mem.write(addr_wh, cpu.l)
+                    mem.write(mask16(addr_wh + 1), cpu.h)
+                    cyc = 16
+                } myon.else {
+                    // LD (nn), A
+                    addr_wa = fetch16(cpu, mem)
+                    mem.write(addr_wa, cpu.a)
+                    cyc = 13
+                }
+            } myon.else {
+                myon.if p == 0 {
+                    // LD A, (BC)
+                    cpu.a = mem.read(get_bc(cpu))
+                    cyc = 7
+                } myon.elif p == 1 then {
+                    // LD A, (DE)
+                    cpu.a = mem.read(get_de(cpu))
+                    cyc = 7
+                } myon.elif p == 2 then {
+                    // LD HL, (nn)
+                    addr_rh = fetch16(cpu, mem)
+                    cpu.l = mem.read(addr_rh)
+                    cpu.h = mem.read(mask16(addr_rh + 1))
+                    cyc = 16
+                } myon.else {
+                    // LD A, (nn)
+                    addr_ra = fetch16(cpu, mem)
+                    cpu.a = mem.read(addr_ra)
+                    cyc = 13
+                }
+            }
+        } myon.elif z == 3 then {
+            // INC rp[p] / DEC rp[p] -- no flags are affected
+            myon.if q == 0 {
+                set_rp(cpu, p, mask16(get_rp(cpu, p) + 1))
+            } myon.else {
+                set_rp(cpu, p, wrap16(get_rp(cpu, p) - 1))
+            }
+            cyc = 6
+        } myon.elif z == 4 then {
+            // INC r[y]
+            set_r(cpu, mem, y, inc8(cpu, get_r(cpu, mem, y)))
+            myon.if y == 6 then { cyc = 11 } myon.else { cyc = 4 }
+        } myon.elif z == 5 then {
+            // DEC r[y]
+            set_r(cpu, mem, y, dec8(cpu, get_r(cpu, mem, y)))
+            myon.if y == 6 then { cyc = 11 } myon.else { cyc = 4 }
+        } myon.elif z == 6 then {
+            // LD r[y], n   (y=6 is LD (HL), n)
+            set_r(cpu, mem, y, fetch8(cpu, mem))
+            myon.if y == 6 then { cyc = 10 } myon.else { cyc = 7 }
+        } myon.else {
+            // z=7: RLCA RRCA RLA RRA DAA CPL SCF CCF -- later Step
+            known = 0
+        }
+    } myon.elif x == 1 then {
+        // -------------------------------------------------------------
+        // x=1: LD r[y], r[z], with HALT carved out of LD (HL),(HL)
+        // -------------------------------------------------------------
+        myon.if y == 6 myon.and z == 6 {
+            cpu.halted = 1
+            cyc = 4
+        } myon.else {
+            set_r(cpu, mem, y, get_r(cpu, mem, z))
+            myon.if y == 6 {
+                cyc = 7
+            } myon.elif z == 6 then {
+                cyc = 7
+            } myon.else {
+                cyc = 4
+            }
+        }
+    } myon.elif x == 2 then {
+        // -------------------------------------------------------------
+        // x=2: alu[y] r[z]
+        // -------------------------------------------------------------
+        alu_apply(cpu, y, get_r(cpu, mem, z))
+        myon.if z == 6 then { cyc = 7 } myon.else { cyc = 4 }
+    } myon.else {
+        // -------------------------------------------------------------
+        // x=3: conditional flow, stack, immediate alu, prefixes
+        // -------------------------------------------------------------
+        myon.if z == 0 {
+            // RET cc[y]
+            myon.if test_cc(cpu, y) == 1 {
+                cpu.pc = pop16(cpu, mem)
+                cyc = 11
+            } myon.else {
+                cyc = 5
+            }
+        } myon.elif z == 1 then {
+            myon.if q == 0 {
+                // POP rp2[p]
+                set_rp2(cpu, p, pop16(cpu, mem))
+                cyc = 10
+            } myon.elif p == 0 then {
+                // RET
+                cpu.pc = pop16(cpu, mem)
+                cyc = 10
+            } myon.else {
+                // p=1 EXX, p=2 JP HL, p=3 LD SP,HL -- later Step
+                known = 0
+            }
+        } myon.elif z == 2 then {
+            // JP cc[y], nn -- the operand is always fetched
+            target_cc = fetch16(cpu, mem)
+            myon.if test_cc(cpu, y) == 1 then { cpu.pc = target_cc }
+            cyc = 10
+        } myon.elif z == 3 then {
+            myon.if y == 0 {
+                // JP nn
+                cpu.pc = fetch16(cpu, mem)
+                cyc = 10
+            } myon.elif y == 2 then {
+                // OUT (n), A
+                port_out = fetch8(cpu, mem)
+                io.write(port_out, cpu.a)
+                cyc = 11
+            } myon.elif y == 3 then {
+                // IN A, (n)
+                port_in = fetch8(cpu, mem)
+                cpu.a = io.read(port_in)
+                cyc = 11
+            } myon.else {
+                // y=1 CB prefix (Step 3), y=4 EX (SP),HL,
+                // y=5 EX DE,HL, y=6 DI, y=7 EI -- later Steps
+                known = 0
+            }
+        } myon.elif z == 4 then {
+            // CALL cc[y], nn
+            target_call_cc = fetch16(cpu, mem)
+            myon.if test_cc(cpu, y) == 1 {
+                push16(cpu, mem, cpu.pc)
+                cpu.pc = target_call_cc
+                cyc = 17
+            } myon.else {
+                cyc = 10
+            }
+        } myon.elif z == 5 then {
+            myon.if q == 0 {
+                // PUSH rp2[p]
+                push16(cpu, mem, get_rp2(cpu, p))
+                cyc = 11
+            } myon.elif p == 0 then {
+                // CALL nn: the return address is the byte after the operand
+                target_call = fetch16(cpu, mem)
+                push16(cpu, mem, cpu.pc)
+                cpu.pc = target_call
+                cyc = 17
+            } myon.else {
+                // p=1 DD prefix, p=2 ED prefix (Step 3), p=3 FD prefix
+                known = 0
+            }
+        } myon.elif z == 6 then {
+            // alu[y] n
+            alu_apply(cpu, y, fetch8(cpu, mem))
+            cyc = 7
+        } myon.else {
+            // z=7: RST y*8 -- later Step
+            known = 0
+        }
+    }
+
+    myon.if known == 0 {
+        // Report the address of the opcode itself, not of the byte after
+        // it, so the message points at the instruction that is missing.
+        at = wrap16(cpu.pc - 1)
+        myon.print("[UNIMPL] 0x{hex8(op)} at PC=0x{hex16(at)}")
+        cyc = 4
+    }
+
+    cpu.cycles = cpu.cycles + cyc
+    ret cyc
+}
+
 // =====================================================================
 // Step 1 verification
 // =====================================================================
@@ -335,7 +1029,552 @@ check_int(str("no cycles consumed"), fresh.cycles, 0)
 
 dump_regs(cpu)
 
-myon.print("=== Step 1 result ===")
+// =====================================================================
+// Step 2 verification
+// =====================================================================
+
+// Load a program at address 0 and execute until HALT (or the instruction
+// budget runs out, so a bug cannot hang the test run).
+myon.func load_and_run(prog: myon.array(int), budget: int) ret Z80 {
+    m = new_memory()
+    p = new_io()
+    c = new_z80()
+    i = 0
+    myon.while i < prog.length() {
+        m.write(i, prog[i])
+        i = i + 1
+    }
+    n = 0
+    myon.while c.halted == 0 myon.and n < budget {
+        step(c, m, p)
+        n = n + 1
+    }
+    ret c
+}
+
+myon.func prog_of() ret myon.array(int) { ret myon.array(int) }
+
+myon.print("--- Step 2: the specified test program ---")
+// 0x3E 0x05   LD A, 5
+// 0x06 0x03   LD B, 3
+// 0x80        ADD A, B
+// 0x76        HALT
+spec = prog_of()
+spec.push(0x3E); spec.push(0x05)
+spec.push(0x06); spec.push(0x03)
+spec.push(0x80)
+spec.push(0x76)
+c_spec = load_and_run(spec, 20)
+myon.print("A={c_spec.a} Z={get_flag_z(c_spec)} C={get_flag_c(c_spec)}")
+check_int(str("A after ADD A,B"), c_spec.a, 8)
+check_int(str("flag Z"), get_flag_z(c_spec), 0)
+check_int(str("flag C"), get_flag_c(c_spec), 0)
+check_int(str("halted"), c_spec.halted, 1)
+// 7 (LD A,n) + 7 (LD B,n) + 4 (ADD A,r) + 4 (HALT)
+check_int(str("cycles consumed"), c_spec.cycles, 22)
+
+myon.print("--- Step 2: 8-bit loads ---")
+// LD B,n / LD C,n / LD D,n / LD E,n / LD H,n / LD L,n / LD A,n then HALT
+imm = prog_of()
+imm.push(0x06); imm.push(0x11)
+imm.push(0x0E); imm.push(0x22)
+imm.push(0x16); imm.push(0x33)
+imm.push(0x1E); imm.push(0x44)
+imm.push(0x26); imm.push(0x55)
+imm.push(0x2E); imm.push(0x66)
+imm.push(0x3E); imm.push(0x77)
+imm.push(0x76)
+c_imm = load_and_run(imm, 40)
+check_int(str("LD B,n"), c_imm.b, 0x11)
+check_int(str("LD C,n"), c_imm.c, 0x22)
+check_int(str("LD D,n"), c_imm.d, 0x33)
+check_int(str("LD E,n"), c_imm.e, 0x44)
+check_int(str("LD H,n"), c_imm.h, 0x55)
+check_int(str("LD L,n"), c_imm.l, 0x66)
+check_int(str("LD A,n"), c_imm.a, 0x77)
+
+// LD r,r' covers the whole 0x40..0x7F block; check a few representatives
+rr = prog_of()
+rr.push(0x3E); rr.push(0x5A)   // LD A, 0x5A
+rr.push(0x47)                   // LD B, A
+rr.push(0x48)                   // LD C, B
+rr.push(0x51)                   // LD D, C
+rr.push(0x7F)                   // LD A, A  (a no-op form)
+rr.push(0x76)                   // HALT
+c_rr = load_and_run(rr, 20)
+check_int(str("LD B,A"), c_rr.b, 0x5A)
+check_int(str("LD C,B"), c_rr.c, 0x5A)
+check_int(str("LD D,C"), c_rr.d, 0x5A)
+check_int(str("LD A,A keeps A"), c_rr.a, 0x5A)
+
+myon.print("--- Step 2: memory loads ---")
+mload = prog_of()
+mload.push(0x21); mload.push(0x00); mload.push(0xC0)  // LD HL, 0xC000
+mload.push(0x3E); mload.push(0xAB)                     // LD A, 0xAB
+mload.push(0x77)                                        // LD (HL), A
+mload.push(0x3E); mload.push(0x00)                     // LD A, 0
+mload.push(0x7E)                                        // LD A, (HL)
+mload.push(0x46)                                        // LD B, (HL)
+mload.push(0x32); mload.push(0x34); mload.push(0x12)  // LD (0x1234), A
+mload.push(0x3E); mload.push(0x00)                     // LD A, 0
+mload.push(0x3A); mload.push(0x34); mload.push(0x12)  // LD A, (0x1234)
+mload.push(0x76)                                        // HALT
+c_mload = load_and_run(mload, 40)
+check_int(str("LD A,(HL) after LD (HL),A"), c_mload.a, 0xAB)
+check_int(str("LD B,(HL)"), c_mload.b, 0xAB)
+check_int(str("LD (nn),A / LD A,(nn) round trip"), c_mload.a, 0xAB)
+
+bcde = prog_of()
+bcde.push(0x01); bcde.push(0x00); bcde.push(0xD0)  // LD BC, 0xD000
+bcde.push(0x11); bcde.push(0x01); bcde.push(0xD0)  // LD DE, 0xD001
+bcde.push(0x3E); bcde.push(0x5C)                    // LD A, 0x5C
+bcde.push(0x02)                                      // LD (BC), A
+bcde.push(0x3E); bcde.push(0x6D)                    // LD A, 0x6D
+bcde.push(0x12)                                      // LD (DE), A
+bcde.push(0x0A)                                      // LD A, (BC)
+bcde.push(0x4F)                                      // LD C, A   (stash it)
+bcde.push(0x1A)                                      // LD A, (DE)
+bcde.push(0x76)                                      // HALT
+c_bcde = load_and_run(bcde, 40)
+check_int(str("LD A,(BC)"), c_bcde.c, 0x5C)
+check_int(str("LD A,(DE)"), c_bcde.a, 0x6D)
+
+myon.print("--- Step 2: 16-bit loads and INC/DEC ---")
+sixteen = prog_of()
+sixteen.push(0x01); sixteen.push(0x34); sixteen.push(0x12)  // LD BC, 0x1234
+sixteen.push(0x11); sixteen.push(0x78); sixteen.push(0x56)  // LD DE, 0x5678
+sixteen.push(0x21); sixteen.push(0xBC); sixteen.push(0x9A)  // LD HL, 0x9ABC
+sixteen.push(0x31); sixteen.push(0xF0); sixteen.push(0xFF)  // LD SP, 0xFFF0
+sixteen.push(0x03)                                            // INC BC
+sixteen.push(0x1B)                                            // DEC DE
+sixteen.push(0x23)                                            // INC HL
+sixteen.push(0x3B)                                            // DEC SP
+sixteen.push(0x76)                                            // HALT
+c_16 = load_and_run(sixteen, 40)
+check_int(str("LD BC,nn then INC BC"), get_bc(c_16), 0x1235)
+check_int(str("LD DE,nn then DEC DE"), get_de(c_16), 0x5677)
+check_int(str("LD HL,nn then INC HL"), get_hl(c_16), 0x9ABD)
+check_int(str("LD SP,nn then DEC SP"), c_16.sp, 0xFFEF)
+
+myon.print("--- Step 2: arithmetic and flags ---")
+// ADD A,n with a carry out: 0xF0 + 0x20 = 0x110 -> A=0x10, C=1
+carry = prog_of()
+carry.push(0x3E); carry.push(0xF0)  // LD A, 0xF0
+carry.push(0xC6); carry.push(0x20)  // ADD A, 0x20
+carry.push(0x76)
+c_carry = load_and_run(carry, 20)
+check_int(str("ADD A,n result"), c_carry.a, 0x10)
+check_int(str("ADD A,n sets C"), get_flag_c(c_carry), 1)
+check_int(str("ADD A,n clears N"), get_flag_n(c_carry), 0)
+
+// half carry: 0x0F + 0x01 = 0x10
+half = prog_of()
+half.push(0x3E); half.push(0x0F)
+half.push(0xC6); half.push(0x01)
+half.push(0x76)
+c_half = load_and_run(half, 20)
+check_int(str("ADD sets H on nibble carry"), get_flag_h(c_half), 1)
+check_int(str("ADD half-carry result"), c_half.a, 0x10)
+
+// signed overflow: 0x7F + 0x01 = 0x80 (+127 + 1 -> -128)
+ovf = prog_of()
+ovf.push(0x3E); ovf.push(0x7F)
+ovf.push(0xC6); ovf.push(0x01)
+ovf.push(0x76)
+c_ovf = load_and_run(ovf, 20)
+check_int(str("ADD sets P/V on overflow"), get_flag_pv(c_ovf), 1)
+check_int(str("ADD sets S on negative result"), get_flag_s(c_ovf), 1)
+
+// SUB producing zero: flags Z=1, N=1
+subz = prog_of()
+subz.push(0x3E); subz.push(0x05)  // LD A, 5
+subz.push(0x06); subz.push(0x05)  // LD B, 5
+subz.push(0x90)                    // SUB B
+subz.push(0x76)
+c_subz = load_and_run(subz, 20)
+check_int(str("SUB to zero -> A"), c_subz.a, 0)
+check_int(str("SUB to zero sets Z"), get_flag_z(c_subz), 1)
+check_int(str("SUB sets N"), get_flag_n(c_subz), 1)
+check_int(str("SUB to zero clears C"), get_flag_c(c_subz), 0)
+
+// SUB borrowing: 5 - 10 = -5 -> 0xFB with C=1
+borrow = prog_of()
+borrow.push(0x3E); borrow.push(0x05)
+borrow.push(0xD6); borrow.push(0x0A)  // SUB 10
+borrow.push(0x76)
+c_borrow = load_and_run(borrow, 20)
+check_int(str("SUB borrow wraps to 8bit"), c_borrow.a, 0xFB)
+check_int(str("SUB borrow sets C"), get_flag_c(c_borrow), 1)
+
+// ADC / SBC honour the incoming carry
+adc = prog_of()
+adc.push(0x3E); adc.push(0xFF)  // LD A, 0xFF
+adc.push(0xC6); adc.push(0x01)  // ADD A, 1  -> A=0, C=1
+adc.push(0x3E); adc.push(0x10)  // LD A, 0x10 (flags untouched by LD)
+adc.push(0xCE); adc.push(0x05)  // ADC A, 5  -> 0x10+5+1
+adc.push(0x76)
+c_adc = load_and_run(adc, 20)
+check_int(str("ADC A,n adds the carry"), c_adc.a, 0x16)
+
+sbc = prog_of()
+sbc.push(0x3E); sbc.push(0x00)
+sbc.push(0xD6); sbc.push(0x01)  // SUB 1 -> A=0xFF, C=1
+sbc.push(0x3E); sbc.push(0x10)
+sbc.push(0xDE); sbc.push(0x05)  // SBC A,5 -> 0x10-5-1
+sbc.push(0x76)
+c_sbc = load_and_run(sbc, 20)
+check_int(str("SBC A,n subtracts the carry"), c_sbc.a, 0x0A)
+
+// AND always sets H; OR/XOR always clear H and C; all set parity
+logic = prog_of()
+logic.push(0x3E); logic.push(0xFF)
+logic.push(0xE6); logic.push(0x0F)  // AND 0x0F
+logic.push(0x76)
+c_logic = load_and_run(logic, 20)
+check_int(str("AND result"), c_logic.a, 0x0F)
+check_int(str("AND sets H"), get_flag_h(c_logic), 1)
+check_int(str("AND clears C"), get_flag_c(c_logic), 0)
+check_int(str("AND parity of 0x0F is even"), get_flag_pv(c_logic), 1)
+
+xorp = prog_of()
+xorp.push(0x3E); xorp.push(0xFF)
+xorp.push(0xEE); xorp.push(0xFF)  // XOR 0xFF -> 0
+xorp.push(0x76)
+c_xor = load_and_run(xorp, 20)
+check_int(str("XOR to zero"), c_xor.a, 0)
+check_int(str("XOR sets Z"), get_flag_z(c_xor), 1)
+check_int(str("XOR clears H"), get_flag_h(c_xor), 0)
+
+orp = prog_of()
+orp.push(0x3E); orp.push(0xF0)
+orp.push(0xF6); orp.push(0x0F)  // OR 0x0F
+orp.push(0x76)
+c_or = load_and_run(orp, 20)
+check_int(str("OR result"), c_or.a, 0xFF)
+check_int(str("OR clears C"), get_flag_c(c_or), 0)
+
+// CP compares without touching A
+cmp = prog_of()
+cmp.push(0x3E); cmp.push(0x42)
+cmp.push(0xFE); cmp.push(0x42)  // CP 0x42 -> equal
+cmp.push(0x76)
+c_cmp = load_and_run(cmp, 20)
+check_int(str("CP leaves A alone"), c_cmp.a, 0x42)
+check_int(str("CP equal sets Z"), get_flag_z(c_cmp), 1)
+check_int(str("CP sets N"), get_flag_n(c_cmp), 1)
+
+cmplt = prog_of()
+cmplt.push(0x3E); cmplt.push(0x10)
+cmplt.push(0xFE); cmplt.push(0x20)  // CP 0x20 -> A < operand
+cmplt.push(0x76)
+c_cmplt = load_and_run(cmplt, 20)
+check_int(str("CP smaller sets C"), get_flag_c(c_cmplt), 1)
+check_int(str("CP smaller clears Z"), get_flag_z(c_cmplt), 0)
+
+myon.print("--- Step 2: INC/DEC r ---")
+incdec = prog_of()
+incdec.push(0x3E); incdec.push(0xFF)  // LD A, 0xFF
+incdec.push(0x3C)                      // INC A -> wraps to 0
+incdec.push(0x76)
+c_incdec = load_and_run(incdec, 20)
+check_int(str("INC A wraps 0xFF -> 0"), c_incdec.a, 0)
+check_int(str("INC wrap sets Z"), get_flag_z(c_incdec), 1)
+check_int(str("INC wrap sets H"), get_flag_h(c_incdec), 1)
+check_int(str("INC clears N"), get_flag_n(c_incdec), 0)
+
+decb = prog_of()
+decb.push(0x06); decb.push(0x01)  // LD B, 1
+decb.push(0x05)                    // DEC B -> 0
+decb.push(0x76)
+c_decb = load_and_run(decb, 20)
+check_int(str("DEC B to zero"), c_decb.b, 0)
+check_int(str("DEC sets Z"), get_flag_z(c_decb), 1)
+check_int(str("DEC sets N"), get_flag_n(c_decb), 1)
+
+// INC/DEC must not disturb the carry flag
+keepc = prog_of()
+keepc.push(0x3E); keepc.push(0xFF)
+keepc.push(0xC6); keepc.push(0x01)  // ADD A,1 -> C=1
+keepc.push(0x0C)                     // INC C
+keepc.push(0x76)
+c_keepc = load_and_run(keepc, 20)
+check_int(str("INC keeps C untouched"), get_flag_c(c_keepc), 1)
+
+myon.print("--- Step 2: ADD HL,rp ---")
+addhl = prog_of()
+addhl.push(0x21); addhl.push(0x00); addhl.push(0x10)  // LD HL, 0x1000
+addhl.push(0x01); addhl.push(0x34); addhl.push(0x02)  // LD BC, 0x0234
+addhl.push(0x09)                                        // ADD HL, BC
+addhl.push(0x11); addhl.push(0x00); addhl.push(0x01)  // LD DE, 0x0100
+addhl.push(0x19)                                        // ADD HL, DE
+addhl.push(0x29)                                        // ADD HL, HL
+addhl.push(0x76)
+c_addhl = load_and_run(addhl, 40)
+// (0x1000 + 0x0234 + 0x0100) * 2 = 0x1334 * 2 = 0x2668
+check_int(str("ADD HL,BC/DE/HL"), get_hl(c_addhl), 0x2668)
+
+hlcarry = prog_of()
+hlcarry.push(0x21); hlcarry.push(0xFF); hlcarry.push(0xFF)  // LD HL, 0xFFFF
+hlcarry.push(0x01); hlcarry.push(0x02); hlcarry.push(0x00)  // LD BC, 2
+hlcarry.push(0x09)                                            // ADD HL, BC
+hlcarry.push(0x76)
+c_hlcarry = load_and_run(hlcarry, 20)
+check_int(str("ADD HL wraps to 16bit"), get_hl(c_hlcarry), 0x0001)
+check_int(str("ADD HL sets C on overflow"), get_flag_c(c_hlcarry), 1)
+check_int(str("ADD HL clears N"), get_flag_n(c_hlcarry), 0)
+
+myon.print("--- Step 2: LD (nn),HL and LD HL,(nn) ---")
+hlmem = prog_of()
+hlmem.push(0x21); hlmem.push(0xCD); hlmem.push(0xAB)  // LD HL, 0xABCD
+hlmem.push(0x22); hlmem.push(0x00); hlmem.push(0xC0)  // LD (0xC000), HL
+hlmem.push(0x21); hlmem.push(0x00); hlmem.push(0x00)  // LD HL, 0
+hlmem.push(0x2A); hlmem.push(0x00); hlmem.push(0xC0)  // LD HL, (0xC000)
+hlmem.push(0x76)
+c_hlmem = load_and_run(hlmem, 30)
+check_int(str("LD (nn),HL / LD HL,(nn) round trip"), get_hl(c_hlmem), 0xABCD)
+
+myon.print("--- Step 2: jumps ---")
+// JP nn skips over an instruction that would clobber A
+jp = prog_of()
+jp.push(0xC3); jp.push(0x06); jp.push(0x00)  // JP 0x0006
+jp.push(0x3E); jp.push(0xFF)                  // LD A, 0xFF  (skipped)
+jp.push(0x76)                                  // HALT        (skipped)
+jp.push(0x3E); jp.push(0x2A)                  // LD A, 42    @0x0006
+jp.push(0x76)                                  // HALT
+c_jp = load_and_run(jp, 20)
+check_int(str("JP nn jumps"), c_jp.a, 0x2A)
+
+// JP Z,nn must not jump while Z is clear, and must jump once it is set
+// Layout: LD A,1 @0 / CP 2 @2 / JP Z @4 / LD B,7 @7 / HALT @9 /
+//         LD B,99 @0x000A / HALT @0x000C
+jpcc = prog_of()
+jpcc.push(0x3E); jpcc.push(0x01)                     // LD A, 1      @0x0000
+jpcc.push(0xFE); jpcc.push(0x02)                     // CP 2 -> Z=0  @0x0002
+jpcc.push(0xCA); jpcc.push(0x0A); jpcc.push(0x00)   // JP Z,0x000A  @0x0004 (not taken)
+jpcc.push(0x06); jpcc.push(0x07)                     // LD B, 7      @0x0007
+jpcc.push(0x76)                                       // HALT         @0x0009
+jpcc.push(0x06); jpcc.push(0x63)                     // LD B, 99     @0x000A
+jpcc.push(0x76)                                       // HALT         @0x000C
+c_jpcc = load_and_run(jpcc, 30)
+check_int(str("JP Z,nn not taken when Z=0"), c_jpcc.b, 7)
+
+// Same layout, but CP now leaves Z=1 so the jump is taken
+jpcc2 = prog_of()
+jpcc2.push(0x3E); jpcc2.push(0x02)                    // LD A, 2      @0x0000
+jpcc2.push(0xFE); jpcc2.push(0x02)                    // CP 2 -> Z=1  @0x0002
+jpcc2.push(0xCA); jpcc2.push(0x0A); jpcc2.push(0x00)  // JP Z,0x000A  @0x0004 (taken)
+jpcc2.push(0x06); jpcc2.push(0x07)                    // LD B, 7      @0x0007 (skipped)
+jpcc2.push(0x76)                                       // HALT         @0x0009
+jpcc2.push(0x06); jpcc2.push(0x63)                    // LD B, 99     @0x000A
+jpcc2.push(0x76)                                       // HALT         @0x000C
+c_jpcc2 = load_and_run(jpcc2, 30)
+check_int(str("JP Z,nn taken when Z=1"), c_jpcc2.b, 99)
+
+// JR e with a forward displacement
+jr = prog_of()
+jr.push(0x18); jr.push(0x02)   // JR +2 -> skips the next two bytes
+jr.push(0x3E); jr.push(0xFF)   // LD A, 0xFF (skipped)
+jr.push(0x3E); jr.push(0x11)   // LD A, 0x11
+jr.push(0x76)
+c_jr = load_and_run(jr, 20)
+check_int(str("JR e jumps forward"), c_jr.a, 0x11)
+
+// JR NZ,e with a negative displacement: a countdown loop.
+// DEC B sits at 0x0002, and JR NZ,-3 at 0x0003 returns to it.
+jrloop = prog_of()
+jrloop.push(0x06); jrloop.push(0x03)  // LD B, 3
+jrloop.push(0x05)                      // DEC B      @0x0002
+jrloop.push(0x20); jrloop.push(0xFD)  // JR NZ, -3   @0x0003
+jrloop.push(0x76)                      // HALT
+c_jrloop = load_and_run(jrloop, 40)
+check_int(str("JR NZ,e loops backwards"), c_jrloop.b, 0)
+check_int(str("loop exits with Z=1"), get_flag_z(c_jrloop), 1)
+
+myon.print("--- Step 2: CALL / RET / stack ---")
+call = prog_of()
+call.push(0x31); call.push(0x00); call.push(0xF0)  // LD SP, 0xF000 @0x0000
+call.push(0xCD); call.push(0x09); call.push(0x00)  // CALL 0x0009   @0x0003
+call.push(0x06); call.push(0x05)                    // LD B, 5       @0x0006
+call.push(0x76)                                      // HALT          @0x0008
+call.push(0x3E); call.push(0x63)                    // LD A, 99      @0x0009
+call.push(0xC9)                                      // RET           @0x000B
+c_call = load_and_run(call, 30)
+check_int(str("CALL runs the subroutine"), c_call.a, 99)
+check_int(str("RET returns after CALL"), c_call.b, 5)
+check_int(str("SP restored after CALL/RET"), c_call.sp, 0xF000)
+
+pushpop = prog_of()
+pushpop.push(0x31); pushpop.push(0x00); pushpop.push(0xF0)  // LD SP, 0xF000
+pushpop.push(0x01); pushpop.push(0x34); pushpop.push(0x12)  // LD BC, 0x1234
+pushpop.push(0xC5)                                            // PUSH BC
+pushpop.push(0xE1)                                            // POP HL
+pushpop.push(0x21); pushpop.push(0x78); pushpop.push(0x56)  // LD HL, 0x5678
+pushpop.push(0xE5)                                            // PUSH HL
+pushpop.push(0xD1)                                            // POP DE
+pushpop.push(0x76)
+c_pp = load_and_run(pushpop, 30)
+check_int(str("PUSH BC / POP HL"), get_hl(c_pp), 0x5678)
+check_int(str("PUSH HL / POP DE"), get_de(c_pp), 0x5678)
+check_int(str("SP balanced after PUSH/POP"), c_pp.sp, 0xF000)
+
+// PUSH AF / POP AF must carry the flag byte across untouched
+pushaf = prog_of()
+pushaf.push(0x31); pushaf.push(0x00); pushaf.push(0xF0)  // LD SP, 0xF000
+pushaf.push(0x3E); pushaf.push(0x00)                      // LD A, 0
+pushaf.push(0xD6); pushaf.push(0x01)                      // SUB 1 -> A=0xFF, S/N/C set
+pushaf.push(0xF5)                                          // PUSH AF
+pushaf.push(0x3E); pushaf.push(0x00)                      // LD A, 0
+pushaf.push(0xC1)                                          // POP BC
+pushaf.push(0x76)
+c_paf = load_and_run(pushaf, 30)
+check_int(str("PUSH AF pushes A into B"), c_paf.b, 0xFF)
+check_int(str("PUSH AF pushes F into C"), c_paf.c, 0xBB)
+
+// RET cc: taken and not taken
+retcc = prog_of()
+retcc.push(0x31); retcc.push(0x00); retcc.push(0xF0)  // LD SP, 0xF000
+retcc.push(0xCD); retcc.push(0x08); retcc.push(0x00)  // CALL 0x0008
+retcc.push(0x76)                                        // HALT @0x0006
+retcc.push(0x00)                                        // filler
+retcc.push(0x3E); retcc.push(0x01)                    // LD A, 1  @0x0008
+retcc.push(0xFE); retcc.push(0x01)                    // CP 1 -> Z=1
+retcc.push(0xC0)                                        // RET NZ  (not taken)
+retcc.push(0x06); retcc.push(0x2A)                    // LD B, 42
+retcc.push(0xC8)                                        // RET Z   (taken)
+retcc.push(0x06); retcc.push(0x63)                    // LD B, 99 (never runs)
+retcc.push(0xC9)
+c_retcc = load_and_run(retcc, 40)
+check_int(str("RET NZ skipped, RET Z taken"), c_retcc.b, 42)
+
+// CALL cc: not taken must fall through
+callcc = prog_of()
+callcc.push(0x31); callcc.push(0x00); callcc.push(0xF0)  // LD SP, 0xF000
+callcc.push(0x3E); callcc.push(0x01)                      // LD A, 1
+callcc.push(0xFE); callcc.push(0x02)                      // CP 2 -> Z=0
+callcc.push(0xCC); callcc.push(0x0D); callcc.push(0x00)  // CALL Z,0x000D (not taken)
+callcc.push(0x06); callcc.push(0x07)                      // LD B, 7
+callcc.push(0x76)                                          // HALT @0x000C
+callcc.push(0x06); callcc.push(0x63)                      // LD B, 99 @0x000D
+callcc.push(0xC9)
+c_callcc = load_and_run(callcc, 40)
+check_int(str("CALL Z,nn not taken when Z=0"), c_callcc.b, 7)
+
+myon.print("--- Step 2: OUT / IN ---")
+// OUT (n),A writes the port, IN A,(n) reads it back
+port = prog_of()
+port.push(0x3E); port.push(0x7B)  // LD A, 0x7B
+port.push(0xD3); port.push(0xA8)  // OUT (0xA8), A
+port.push(0x3E); port.push(0x00)  // LD A, 0
+port.push(0xDB); port.push(0xA8)  // IN A, (0xA8)
+port.push(0x76)
+c_port = load_and_run(port, 20)
+check_int(str("OUT (n),A then IN A,(n)"), c_port.a, 0x7B)
+
+myon.print("--- Step 2: HALT ---")
+halt = prog_of()
+halt.push(0x76)                    // HALT
+halt.push(0x3E); halt.push(0xFF)  // LD A, 0xFF (must never run)
+c_halt = load_and_run(halt, 20)
+check_int(str("HALT sets the halted flag"), c_halt.halted, 1)
+check_int(str("HALT stops before the next instruction"), c_halt.a, 0)
+check_int(str("HALT leaves PC after the opcode"), c_halt.pc, 1)
+
+myon.print("--- Step 2: hex formatting ---")
+// str has no methods in Myon, so compare the formatted text directly.
+myon.func check_str(label: str, actual: str, expected: str) ret void {
+    checks_total = checks_total + 1
+    myon.if actual == expected {
+        myon.print("  ok   {label}: {actual}")
+    } myon.else {
+        checks_failed = checks_failed + 1
+        myon.print("  FAIL {label}: got {actual}, expected {expected}")
+    }
+}
+check_str(str("hex8 pads to two digits"), hex8(0x0F), str("0F"))
+check_str(str("hex8 of the DJNZ opcode"), hex8(0x10), str("10"))
+check_str(str("hex8 of 255"), hex8(255), str("FF"))
+check_str(str("hex16 pads to four digits"), hex16(0x1234), str("1234"))
+check_str(str("hex16 of 0xABCD"), hex16(0xABCD), str("ABCD"))
+check_str(str("hex16 of 0"), hex16(0), str("0000"))
+
+myon.print("--- Step 2: (HL) as an ALU operand ---")
+alumem = prog_of()
+alumem.push(0x21); alumem.push(0x00); alumem.push(0xC0)  // LD HL, 0xC000
+alumem.push(0x3E); alumem.push(0x03)                      // LD A, 3
+alumem.push(0x77)                                          // LD (HL), A
+alumem.push(0x3E); alumem.push(0x05)                      // LD A, 5
+alumem.push(0x86)                                          // ADD A, (HL) -> 8
+alumem.push(0x34)                                          // INC (HL)    -> 4
+alumem.push(0x46)                                          // LD B, (HL)
+alumem.push(0x76)
+c_alumem = load_and_run(alumem, 40)
+check_int(str("ADD A,(HL)"), c_alumem.a, 8)
+check_int(str("INC (HL)"), c_alumem.b, 4)
+
+myon.print("--- Step 2: full flag byte cross-checks ---")
+// The whole F byte is checked against hand-computed values so a wrong
+// flag cannot hide behind a test that only looks at one bit.
+//
+// LD A,0x0F / ADD A,0x01 -> A=0x10
+//   S=0 Z=0 F5=0 H=1 F3=0 P/V=0 N=0 C=0  => 0b00010000 = 0x10
+flagsa = prog_of()
+flagsa.push(0x3E); flagsa.push(0x0F)
+flagsa.push(0xC6); flagsa.push(0x01)
+flagsa.push(0x76)
+c_fa = load_and_run(flagsa, 20)
+check_int(str("F after 0x0F+0x01"), c_fa.f, 0x10)
+
+// LD A,0x00 / SUB 0x01 -> A=0xFF
+//   S=1 Z=0 F5=1 H=1 F3=1 P/V=0 N=1 C=1  => 0b10111011 = 0xBB
+flagsb = prog_of()
+flagsb.push(0x3E); flagsb.push(0x00)
+flagsb.push(0xD6); flagsb.push(0x01)
+flagsb.push(0x76)
+c_fb = load_and_run(flagsb, 20)
+check_int(str("F after 0x00-0x01"), c_fb.f, 0xBB)
+
+// LD A,0x7F / ADD A,0x01 -> A=0x80
+//   S=1 Z=0 F5=0 H=1 F3=0 P/V=1 N=0 C=0  => 0b10010100 = 0x94
+flagsc = prog_of()
+flagsc.push(0x3E); flagsc.push(0x7F)
+flagsc.push(0xC6); flagsc.push(0x01)
+flagsc.push(0x76)
+c_fc = load_and_run(flagsc, 20)
+check_int(str("F after 0x7F+0x01 (overflow)"), c_fc.f, 0x94)
+
+// LD A,0xFF / AND 0x0F -> A=0x0F
+//   S=0 Z=0 F5=0 H=1 F3=1 P/V=1 N=0 C=0  => 0b00011100 = 0x1C
+flagsd = prog_of()
+flagsd.push(0x3E); flagsd.push(0xFF)
+flagsd.push(0xE6); flagsd.push(0x0F)
+flagsd.push(0x76)
+c_fd = load_and_run(flagsd, 20)
+check_int(str("F after AND 0x0F"), c_fd.f, 0x1C)
+
+// LD A,0xFF / XOR 0xFF -> A=0x00
+//   S=0 Z=1 F5=0 H=0 F3=0 P/V=1 N=0 C=0  => 0b01000100 = 0x44
+flagse = prog_of()
+flagse.push(0x3E); flagse.push(0xFF)
+flagse.push(0xEE); flagse.push(0xFF)
+flagse.push(0x76)
+c_fe = load_and_run(flagse, 20)
+check_int(str("F after XOR to zero"), c_fe.f, 0x44)
+
+// CP takes F5/F3 from the operand, not the result:
+// LD A,0x00 / CP 0x28 -> result 0xD8, but operand 0x28 has bit5=1 bit3=1
+//   S=1 Z=0 F5=1 H=1 F3=1 P/V=0 N=1 C=1  => 0xBB
+flagsf = prog_of()
+flagsf.push(0x3E); flagsf.push(0x00)
+flagsf.push(0xFE); flagsf.push(0x28)
+flagsf.push(0x76)
+c_ff = load_and_run(flagsf, 20)
+check_int(str("CP takes F5/F3 from the operand"), c_ff.f, 0xBB)
+check_int(str("CP leaves A untouched"), c_ff.a, 0x00)
+
+myon.print("--- Step 2: register dump ---")
+dump_regs_hex(c_spec)
+
+myon.print("=== Step 1 + Step 2 result ===")
 myon.if checks_failed == 0 {
     myon.print("all {checks_total} checks passed")
 } myon.else {
